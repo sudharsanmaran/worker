@@ -1,8 +1,12 @@
 import os
 import pika
 import torch
+from azure.storage.blob import BlobServiceClient
 from diffusers import StableDiffusionPipeline, EulerDiscreteScheduler
 from io import BytesIO
+from dotenv import load_dotenv
+import uuid
+
 
 # Initialize Stable Diffusion model
 model_id = "stabilityai/stable-diffusion-2-1-base"
@@ -22,6 +26,48 @@ connection = pika.BlockingConnection(pika.ConnectionParameters(host=rabbitmq_hos
 channel = connection.channel()
 channel.queue_declare(queue=queue_name)
 channel.queue_declare(queue=response_queue)
+
+
+load_dotenv()
+
+
+def upload_image_to_blob(byte_arr, name):
+    # Connect to the blob storage account
+    connect_str = f"DefaultEndpointsProtocol=https;AccountName={os.getenv('AZURE_ACCOUNT_NAME')};AccountKey={os.getenv('AZURE_ACCOUNT_KEY')}"
+
+    try:
+        # Create the BlobServiceClient object which will be used to create a container client
+        blob_service_client = BlobServiceClient.from_connection_string(connect_str)
+    except Exception as e:
+        print(f"An exception occurred while creating BlobServiceClient: {e}")
+        return
+
+    # Get the existing container
+    container_name = os.getenv("AZURE_CONTAINER_NAME")
+
+    try:
+        # Get the container client
+        container_client = blob_service_client.get_container_client(container_name)
+    except Exception as e:
+        print(f"An exception occurred while getting container client: {e}")
+        return
+
+    try:
+        # Create a blob client using the blob name
+        blob_client = container_client.get_blob_client(name)
+
+        # Upload image data to blob
+        blob_client.upload_blob(byte_arr, overwrite=True)
+
+        # Generate image URL
+        image_url = blob_client.url
+
+        # Print the image URL
+        print(image_url)
+        return image_url
+
+    except Exception as e:
+        print(f"An exception occurred while uploading the file: {e}")
 
 
 def generate_image(
@@ -47,17 +93,27 @@ def generate_image(
 def on_request(ch, method, properties, body):
     # Todo
     # Receive prompt and other properties from request queue
-    prompt = body.decode()
-    print(f"Received prompt: {prompt}")
-
+    request_data = body.decode()
+    prompt = request_data["prompt"]
+    height = request_data["height"]
+    width = request_data["width"]
+    num_inference_steps = request_data["num_inference_steps"]
+    guidance_scale = request_data["guidance_scale"]
     # Generate image
-    image_data = generate_image(prompt)
+
+    byte_arr = generate_image(prompt, height, width, num_inference_steps, guidance_scale)
+
+    random_str = str(uuid.uuid4())
+    images_name= f"{os.getenv('BASE_NAME')}-{random_str}"
+
+    # Upload image to blob
+    image_url = upload_image_to_blob(byte_arr, images_name)
 
     # Send response back to response queue
     ch.basic_publish(
         exchange="",
         routing_key=response_queue,
-        body=image_data,
+        body={"response": image_url},
         properties=pika.BasicProperties(correlation_id=properties.correlation_id),
     )
 
